@@ -20,7 +20,7 @@ swift rlhf \
     --vllm_mode colocate \
     --vllm_gpu_memory_utilization 0.5 \
     --vllm_tensor_parallel_size 1 \
-    --train_type full \
+    --tuner_type full \
     --torch_dtype bfloat16 \
     --load_from_cache_file true \
     --max_length 8192 \
