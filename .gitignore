@@ -137,7 +137,7 @@ eval_output/
 eval_outputs/
 vlmeval/
 my_model/
-/data
+# /data
 result/
 images
 /custom/
@@ -154,3 +154,19 @@ megatron_output/
 
 # ast template
 ast_index_file.py
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

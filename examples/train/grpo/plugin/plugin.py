@@ -1,23 +1,24 @@
 import asyncio
-import json
 import os
 import random
 import re
 import textwrap
-import torch
 from collections import Counter
 from copy import deepcopy
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Tuple, Union
 
-from swift.infer_engine import RequestConfig, TransformersEngine
-from swift.infer_engine.protocol import ChatCompletionResponse, ChatCompletionResponseChoice, RolloutInferRequest
-from swift.rewards import ORM, AsyncORM, orms, rm_plugins
-from swift.rewards.rm_plugin import DefaultRMPlugin
+import json
+import torch
+
+from swift.llm import PtEngine, RequestConfig, RolloutInferRequest, Template, to_device
+from swift.llm.infer.protocol import ChatCompletionResponse, ChatCompletionResponseChoice
+from swift.plugin import ORM, AsyncORM, orms, rm_plugins
 # register context manager(used in gym training)
-from swift.rollout.gym_env import ContextManager, Env, context_managers, envs
-from swift.rollout.multi_turn import MultiTurnScheduler, multi_turns
-from swift.template import Template
-from swift.utils import get_logger, to_device
+from swift.plugin.context_manager import ContextManager, context_managers
+from swift.plugin.env import Env, envs
+from swift.plugin.multi_turn import MultiTurnScheduler, multi_turns
+from swift.plugin.rm_plugin import DefaultRMPlugin
+from swift.utils import get_logger
 
 logger = get_logger()
 """
@@ -36,7 +37,7 @@ TO CUSTOMIZE REWARD FUNCTION:
 """
 
 
-# For additional reward functions, refer to swift/rewards/orm.py.
+# For additional reward functions, refer to swift/plugin/orm.py.
 class CountdownORM(ORM):
 
     def __call__(self, completions, target, nums, **kwargs) -> List[float]:
@@ -139,6 +140,141 @@ class MultiModalAccuracyORM(ORM):
 orms['external_r1v_acc'] = MultiModalAccuracyORM
 
 
+_FLOAT_PATTERN = r'-?\d+(?:\.\d+)?'
+_BOX_PATTERN = (rf'<box>\[\s*{_FLOAT_PATTERN}\s*,\s*{_FLOAT_PATTERN}\s*,\s*{_FLOAT_PATTERN}\s*,\s*'
+                rf'{_FLOAT_PATTERN}\s*\]</box>')
+_GROUNDING_PATTERN = rf'<obj>.+?</obj>\s*{_BOX_PATTERN}\s*<t>{_FLOAT_PATTERN}</t>'
+
+
+def _extract_last_tag(text: str, tag: str) -> Optional[str]:
+    matches = re.findall(rf'<{tag}>(.*?)</{tag}>', text, re.DOTALL)
+    if not matches:
+        return None
+    return matches[-1].strip()
+
+
+def _has_single_nonempty_tag(text: str, tag: str) -> bool:
+    matches = re.findall(rf'<{tag}>(.*?)</{tag}>', text, re.DOTALL)
+    return len(matches) == 1 and bool(matches[0].strip())
+
+
+def _parse_spans(text: Optional[str]) -> List[Tuple[float, float]]:
+    if not text:
+        return []
+    spans = []
+    for start, end in re.findall(rf'\[\s*({_FLOAT_PATTERN})\s*,\s*({_FLOAT_PATTERN})\s*\]', text):
+        start, end = float(start), float(end)
+        if end < start:
+            start, end = end, start
+        if end > start:
+            spans.append((start, end))
+    return spans
+
+
+def _merge_spans(spans: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    if not spans:
+        return []
+    merged = [list(sorted(spans)[0])]
+    for start, end in sorted(spans)[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1][1] = max(last_end, end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def _spans_length(spans: List[Tuple[float, float]]) -> float:
+    return sum(end - start for start, end in _merge_spans(spans))
+
+
+def _temporal_iou(pred_spans: List[Tuple[float, float]], gt_spans: List[Tuple[float, float]]) -> float:
+    pred_spans = _merge_spans(pred_spans)
+    gt_spans = _merge_spans(gt_spans)
+    if not pred_spans or not gt_spans:
+        return 0.0
+
+    intersection = 0.0
+    i = j = 0
+    while i < len(pred_spans) and j < len(gt_spans):
+        pred_start, pred_end = pred_spans[i]
+        gt_start, gt_end = gt_spans[j]
+        overlap = min(pred_end, gt_end) - max(pred_start, gt_start)
+        if overlap > 0:
+            intersection += overlap
+        if pred_end <= gt_end:
+            i += 1
+        else:
+            j += 1
+
+    union = _spans_length(pred_spans) + _spans_length(gt_spans) - intersection
+    if union <= 0:
+        return 0.0
+    return intersection / union
+
+
+def _is_temporal_answer(solution: str) -> bool:
+    answer = _extract_last_tag(solution, 'answer')
+    if not answer:
+        return False
+    return len(_parse_spans(answer)) == 1 and re.fullmatch(
+        rf'\s*\[\s*{_FLOAT_PATTERN}\s*,\s*{_FLOAT_PATTERN}\s*\]\s*', answer) is not None
+
+
+def _normalize_choice(answer: Optional[str]) -> str:
+    if not answer:
+        return ''
+    return answer.strip().strip('()').upper()
+
+
+def _answer_acc(completion: str, solution: str) -> float:
+    pred = _normalize_choice(_extract_last_tag(completion, 'answer'))
+    gt = _normalize_choice(_extract_last_tag(solution, 'answer'))
+    return float(bool(pred) and pred == gt)
+
+
+class VideoTaskReward(ORM):
+
+    def __call__(self, completions, solution, **kwargs) -> List[float]:
+        rewards = []
+        for completion, sol in zip(completions, solution):
+            if _is_temporal_answer(sol):
+                pred_spans = _parse_spans(_extract_last_tag(completion, 'answer'))
+                gt_spans = _parse_spans(_extract_last_tag(sol, 'answer'))
+                rewards.append(_temporal_iou(pred_spans, gt_spans))
+                continue
+
+            rewards.append(_answer_acc(completion, sol))
+        return rewards
+
+
+orms['external_vl_task_reward'] = VideoTaskReward
+
+
+class VideoFormatReward(ORM):
+
+    def __call__(self, completions, solution, **kwargs) -> List[float]:
+        rewards = []
+        for completion, sol in zip(completions, solution):
+            reward = 0.0
+            has_think = _has_single_nonempty_tag(completion, 'think')
+            has_answer = _has_single_nonempty_tag(completion, 'answer')
+
+            if has_think and has_answer:
+                reward += 1.0
+            elif has_answer:
+                reward += 0.5
+
+            if re.search(_GROUNDING_PATTERN, completion, re.DOTALL) is not None:
+                reward += 1.0
+
+            rewards.append(reward)
+        return rewards
+
+
+orms['external_vl_format_reward'] = VideoFormatReward
+
+
 class MultiTurnThinkingTips(ORM):
     """
     A reward function example designed for use with the `ThinkingTipsScheduler`.
@@ -154,9 +290,8 @@ class MultiTurnThinkingTips(ORM):
     function **must return an identical reward for every fragment**
     """
 
-    def __init__(self, args=None, **kwargs):
-        super().__init__(args)
-        from swift.rewards.orm import MathAccuracy
+    def __init__(self):
+        from swift.plugin.orm import MathAccuracy
         self.acc_func = MathAccuracy()
 
     def __call__(self, completions, **kwargs) -> List[float]:
@@ -184,8 +319,7 @@ orms['thinking_tips'] = MultiTurnThinkingTips
 # ref implementation: https://github.com/huggingface/open-r1/blob/main/src/open_r1/rewards.py
 class CodeReward(ORM):
 
-    def __init__(self, args=None, **kwargs):
-        super().__init__(args)
+    def __init__(self):
         import importlib.util
         assert importlib.util.find_spec('e2b') is not None, (
             "The e2b package is required but not installed. Please install it using 'pip install e2b-code-interpreter'."
@@ -370,8 +504,7 @@ class CodeRewardByJudge0(ORM):
     }
     PYTHON_ID = 71
 
-    def __init__(self, args, **kwargs):
-        super().__init__(args)
+    def __init__(self):
         self.endpoint = os.getenv('JUDGE0_ENDPOINT')
         assert self.endpoint is not None, (
             'Judge0 endpoint is not set. Please set the JUDGE0_ENDPOINT environment variable.')
@@ -491,8 +624,7 @@ class AsyncGenRMReward(AsyncORM):
            ```
     """
 
-    def __init__(self, args, **kwargs):
-        super().__init__(args)
+    def __init__(self):
         from openai import OpenAI
         self.api_base = os.getenv('GENRM_API_BASE', 'http://localhost:8000/v1')
         self.temperature = float(os.getenv('GENRM_TEMPERATURE', '0.3'))
@@ -641,8 +773,7 @@ orms['async_genrm'] = AsyncGenRMReward
 # COARSEREWARD -> Coarse, INTERMEDIATEREWARD -> Intermediate, REFINEDREWARD -> Finegrained
 class ToolUseFormatReward(ORM):
 
-    def __init__(self, args=None, **kwargs):
-        super().__init__(args)
+    def __init__(self):
         self.format_max_possible = 1.0
         self.format_min_possible = 0.0
 
@@ -705,8 +836,7 @@ orms['external_tooluse_format_reward'] = ToolUseFormatReward
 
 class ToolUseLengthReward(ORM):
 
-    def __init__(self, args=None, **kwargs):
-        super().__init__(args)
+    def __init__(self):
         self.length_max_possible = 1.0
         self.length_min_possible = 0.0
 
@@ -745,8 +875,7 @@ orms['external_tooluse_length_reward'] = ToolUseLengthReward
 
 class ToolUseCorrectnessReward(ORM):
 
-    def __init__(self, args=None, **kwargs):
-        super().__init__(args)
+    def __init__(self):
         if str(os.getenv('CORRECTMAX1', 0)) == '1':
             self.tool_max_possible = 1.0
             self.tool_min_possible = -1.0
@@ -907,7 +1036,7 @@ TO CUSTOMIZE REWARD MODEL:
         --external_plugins /path/to/plugin.py \
         --reward_model_plugin my_rm_plugin
 
-For GenRM you can refer to swift/rewards/rm_plugin/GenRMPlugin
+For GenRM you can refer to swift/llm/plugin/rm_plugin/GenRMPlugin
 """
 
 
@@ -939,8 +1068,8 @@ class QwenLongPlugin(DefaultRMPlugin):
     # ms_dataset: https://modelscope.cn/datasets/iic/DocQA-RL-1.6K
     def __init__(self, model, template, accuracy_orm=None):
         super().__init__(model, template)
-        # initialize TransformersEngine to infer
-        self.engine = TransformersEngine(self.model, template=self.template, max_batch_size=0)  # 0: no limit
+        # initilize PTEngine to infer
+        self.engine = PtEngine.from_model_template(self.model, self.template, max_batch_size=0)  # 0: no limit
         self.request_config = RequestConfig(temperature=0)  # customise your request config here
         self.system = textwrap.dedent("""
             You are an expert in verifying if two answers are the same.
