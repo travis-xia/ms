@@ -1,24 +1,23 @@
 import asyncio
+import json
 import os
 import random
 import re
 import textwrap
+import torch
 from collections import Counter
 from copy import deepcopy
 from typing import Dict, List, Optional, Tuple, Union
 
-import json
-import torch
-
-from swift.llm import PtEngine, RequestConfig, RolloutInferRequest, Template, to_device
-from swift.llm.infer.protocol import ChatCompletionResponse, ChatCompletionResponseChoice
-from swift.plugin import ORM, AsyncORM, orms, rm_plugins
+from swift.infer_engine import RequestConfig, TransformersEngine
+from swift.infer_engine.protocol import ChatCompletionResponse, ChatCompletionResponseChoice, RolloutInferRequest
+from swift.rewards import ORM, AsyncORM, orms, rm_plugins
+from swift.rewards.rm_plugin import DefaultRMPlugin
 # register context manager(used in gym training)
-from swift.plugin.context_manager import ContextManager, context_managers
-from swift.plugin.env import Env, envs
-from swift.plugin.multi_turn import MultiTurnScheduler, multi_turns
-from swift.plugin.rm_plugin import DefaultRMPlugin
-from swift.utils import get_logger
+from swift.rollout.gym_env import ContextManager, Env, context_managers, envs
+from swift.rollout.multi_turn import MultiTurnScheduler, multi_turns
+from swift.template import Template
+from swift.utils import get_logger, to_device
 
 logger = get_logger()
 """
@@ -37,7 +36,7 @@ TO CUSTOMIZE REWARD FUNCTION:
 """
 
 
-# For additional reward functions, refer to swift/plugin/orm.py.
+# For additional reward functions, refer to swift/rewards/orm.py.
 class CountdownORM(ORM):
 
     def __call__(self, completions, target, nums, **kwargs) -> List[float]:
@@ -290,8 +289,9 @@ class MultiTurnThinkingTips(ORM):
     function **must return an identical reward for every fragment**
     """
 
-    def __init__(self):
-        from swift.plugin.orm import MathAccuracy
+    def __init__(self, args=None, **kwargs):
+        super().__init__(args)
+        from swift.rewards.orm import MathAccuracy
         self.acc_func = MathAccuracy()
 
     def __call__(self, completions, **kwargs) -> List[float]:
@@ -319,7 +319,8 @@ orms['thinking_tips'] = MultiTurnThinkingTips
 # ref implementation: https://github.com/huggingface/open-r1/blob/main/src/open_r1/rewards.py
 class CodeReward(ORM):
 
-    def __init__(self):
+    def __init__(self, args=None, **kwargs):
+        super().__init__(args)
         import importlib.util
         assert importlib.util.find_spec('e2b') is not None, (
             "The e2b package is required but not installed. Please install it using 'pip install e2b-code-interpreter'."
@@ -504,7 +505,8 @@ class CodeRewardByJudge0(ORM):
     }
     PYTHON_ID = 71
 
-    def __init__(self):
+    def __init__(self, args, **kwargs):
+        super().__init__(args)
         self.endpoint = os.getenv('JUDGE0_ENDPOINT')
         assert self.endpoint is not None, (
             'Judge0 endpoint is not set. Please set the JUDGE0_ENDPOINT environment variable.')
@@ -624,7 +626,8 @@ class AsyncGenRMReward(AsyncORM):
            ```
     """
 
-    def __init__(self):
+    def __init__(self, args, **kwargs):
+        super().__init__(args)
         from openai import OpenAI
         self.api_base = os.getenv('GENRM_API_BASE', 'http://localhost:8000/v1')
         self.temperature = float(os.getenv('GENRM_TEMPERATURE', '0.3'))
@@ -773,7 +776,8 @@ orms['async_genrm'] = AsyncGenRMReward
 # COARSEREWARD -> Coarse, INTERMEDIATEREWARD -> Intermediate, REFINEDREWARD -> Finegrained
 class ToolUseFormatReward(ORM):
 
-    def __init__(self):
+    def __init__(self, args=None, **kwargs):
+        super().__init__(args)
         self.format_max_possible = 1.0
         self.format_min_possible = 0.0
 
@@ -836,7 +840,8 @@ orms['external_tooluse_format_reward'] = ToolUseFormatReward
 
 class ToolUseLengthReward(ORM):
 
-    def __init__(self):
+    def __init__(self, args=None, **kwargs):
+        super().__init__(args)
         self.length_max_possible = 1.0
         self.length_min_possible = 0.0
 
@@ -875,7 +880,8 @@ orms['external_tooluse_length_reward'] = ToolUseLengthReward
 
 class ToolUseCorrectnessReward(ORM):
 
-    def __init__(self):
+    def __init__(self, args=None, **kwargs):
+        super().__init__(args)
         if str(os.getenv('CORRECTMAX1', 0)) == '1':
             self.tool_max_possible = 1.0
             self.tool_min_possible = -1.0
@@ -1036,7 +1042,7 @@ TO CUSTOMIZE REWARD MODEL:
         --external_plugins /path/to/plugin.py \
         --reward_model_plugin my_rm_plugin
 
-For GenRM you can refer to swift/llm/plugin/rm_plugin/GenRMPlugin
+For GenRM you can refer to swift/rewards/rm_plugin/GenRMPlugin
 """
 
 
@@ -1068,8 +1074,8 @@ class QwenLongPlugin(DefaultRMPlugin):
     # ms_dataset: https://modelscope.cn/datasets/iic/DocQA-RL-1.6K
     def __init__(self, model, template, accuracy_orm=None):
         super().__init__(model, template)
-        # initilize PTEngine to infer
-        self.engine = PtEngine.from_model_template(self.model, self.template, max_batch_size=0)  # 0: no limit
+        # initialize TransformersEngine to infer
+        self.engine = TransformersEngine(self.model, template=self.template, max_batch_size=0)  # 0: no limit
         self.request_config = RequestConfig(temperature=0)  # customise your request config here
         self.system = textwrap.dedent("""
             You are an expert in verifying if two answers are the same.
