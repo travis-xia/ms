@@ -264,8 +264,14 @@ class VideoFormatReward(ORM):
             elif has_answer:
                 reward += 0.5
 
+            # Step-by-step reward shaping for grounding
+            if '<obj>' in completion:
+                reward += 0.4
+            if '<box>' in completion:
+                reward += 0.4
+
             if re.search(_GROUNDING_PATTERN, completion, re.DOTALL) is not None:
-                reward += 2.0
+                reward += 1.2
 
             rewards.append(reward)
         return rewards
