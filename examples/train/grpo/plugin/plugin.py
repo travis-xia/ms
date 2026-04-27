@@ -141,8 +141,8 @@ orms['external_r1v_acc'] = MultiModalAccuracyORM
 
 _FLOAT_PATTERN = r'-?\d+(?:\.\d+)?'
 _BOX_PATTERN = (rf'<box>\[\s*{_FLOAT_PATTERN}\s*,\s*{_FLOAT_PATTERN}\s*,\s*{_FLOAT_PATTERN}\s*,\s*'
-                rf'{_FLOAT_PATTERN}\s*\]</box>')
-_GROUNDING_PATTERN = rf'<obj>.+?</obj>\s*{_BOX_PATTERN}\s*<t>{_FLOAT_PATTERN}</t>'
+                rf'{_FLOAT_PATTERN}\s*,\s*{_FLOAT_PATTERN}\s*\]</box>')
+_GROUNDING_PATTERN = rf'<obj>.+?</obj>\s*{_BOX_PATTERN}'
 
 
 def _extract_last_tag(text: str, tag: str) -> Optional[str]:
@@ -265,7 +265,7 @@ class VideoFormatReward(ORM):
                 reward += 0.5
 
             if re.search(_GROUNDING_PATTERN, completion, re.DOTALL) is not None:
-                reward += 1.0
+                reward += 2.0
 
             rewards.append(reward)
         return rewards
