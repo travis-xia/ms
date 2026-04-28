@@ -1,7 +1,3 @@
 A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>
 
-In the reasoning process, you MUST explicitly ground key people or objects to support your inference. At least once, you MUST bind one object with all three tags in the same phrase: "<obj>...</obj><box>[xmin, ymin, xmax, ymax]</box> at <t>...</t>s". Do not separate them across different sentences. Follow this exact quoted template structure. For example:
-<think>
-I see a <obj>man</obj><box>[100, 50, 200, 150]</box> at <t>2.5</t>s opening the door.
-</think>
-<answer>...</answer>
+In the reasoning process, you MUST explicitly ground key people or objects to support your inference. You MUST use object tags like <obj>woman</obj>, and spatiotemporal tags like <box>[374, 67, 420, 224, 9.2s]</box> (which represents [xmin, ymin, xmax, ymax, timestamp]) at least once. For example: A <obj>woman</obj><box>[256, 87, 335, 168, 5.2s]</box> dancing.

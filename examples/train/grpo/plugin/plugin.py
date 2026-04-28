@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 import random
 import re
@@ -140,9 +141,12 @@ orms['external_r1v_acc'] = MultiModalAccuracyORM
 
 
 _FLOAT_PATTERN = r'-?\d+(?:\.\d+)?'
-_BOX_PATTERN = (rf'<box>\[\s*{_FLOAT_PATTERN}\s*,\s*{_FLOAT_PATTERN}\s*,\s*{_FLOAT_PATTERN}\s*,\s*'
-                rf'{_FLOAT_PATTERN}\s*\]</box>')
-_GROUNDING_PATTERN = rf'<obj>.+?</obj>\s*{_BOX_PATTERN}(?:\s*at\s*)?<t>{_FLOAT_PATTERN}</t>s'
+# Spatiotemporal box: [xmin, ymin, xmax, ymax, timestamp] e.g. [374, 67, 420, 224, 9.2s]
+_BOX_TIME_PATTERN = rf'{_FLOAT_PATTERN}\s*s'
+_BOX_PATTERN = (
+    rf'<box>\[\s*{_FLOAT_PATTERN}\s*,\s*{_FLOAT_PATTERN}\s*,\s*{_FLOAT_PATTERN}\s*,\s*'
+    rf'{_FLOAT_PATTERN}\s*,\s*{_BOX_TIME_PATTERN}\s*\]</box>')
+_GROUNDING_PATTERN = rf'<obj>.+?</obj>\s*{_BOX_PATTERN}'
 
 
 def _extract_last_tag(text: str, tag: str) -> Optional[str]:
@@ -250,32 +254,49 @@ class VideoTaskReward(ORM):
 orms['external_vl_task_reward'] = VideoTaskReward
 
 
+def _video_format_reward_anneal_scale(trainer_state) -> float:
+    """格式奖励余弦退火：满分为 2，在前 30% 步数内按 half-cosine 缩放到满分为 1（两端缓、中间快），之后保持。"""
+    if trainer_state is None:
+        return 1.0
+    max_steps = getattr(trainer_state, 'max_steps', -1) or -1
+    if max_steps <= 0:
+        return 1.0
+    global_step = getattr(trainer_state, 'global_step', 0) or 0
+    progress = min(max(global_step / float(max_steps), 0.0), 1.0)
+    anneal_end = 0.35
+    scale_start = 1.0
+    scale_at_end = 1.0 / 2.0
+    if progress >= anneal_end:
+        return scale_at_end
+    t = progress / anneal_end
+    return scale_at_end + (scale_start - scale_at_end) * 0.5 * (1.0 + math.cos(math.pi * t))
+
+
 class VideoFormatReward(ORM):
 
     def __call__(self, completions, solution, **kwargs) -> List[float]:
+        scale = _video_format_reward_anneal_scale(kwargs.get('trainer_state'))
         rewards = []
         for completion, sol in zip(completions, solution):
             reward = 0.0
-            has_think = _has_single_nonempty_tag(completion, 'think')
+            has_redacted_thinking = _has_single_nonempty_tag(completion, 'redacted_thinking')
             has_answer = _has_single_nonempty_tag(completion, 'answer')
 
-            if has_think and has_answer:
+            if has_redacted_thinking and has_answer:
                 reward += 1.0
             elif has_answer:
                 reward += 0.5
 
-            # Step-by-step reward shaping for grounding
+            # Step-by-step reward shaping for grounding (obj + spatiotemporal box)
             if '<obj>' in completion and '</obj>' in completion:
-                reward += 0.3
-            if '<box>' in completion and '</box>' in completion:
-                reward += 0.3
-            if '<t>' in completion and '</t>s' in completion:
                 reward += 0.2
+            if re.search(_BOX_PATTERN, completion, re.DOTALL) is not None:
+                reward += 0.3
 
             if re.search(_GROUNDING_PATTERN, completion, re.DOTALL) is not None:
-                reward += 1.2
+                reward += 0.5
 
-            rewards.append(reward)
+            rewards.append(reward * scale)
         return rewards
 
 
