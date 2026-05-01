@@ -428,14 +428,14 @@ class GroundingJudgeReward(AsyncORM):
     grounding tags in MCQ completions.
 
     Env vars:
-        GROUNDING_JUDGE_API_BASE  – OpenAI-compatible endpoint (default http://localhost:8100/v1)
+        GROUNDING_JUDGE_API_BASE  – OpenAI-compatible endpoint (default http://localhost:12999/v1)
         GROUNDING_JUDGE_MAX_TAGS  – max grounding tags to verify per completion (default 3)
     """
 
     def __init__(self, args=None, **kwargs):
         super().__init__(args)
         from openai import OpenAI
-        self.api_base = os.getenv('GROUNDING_JUDGE_API_BASE', 'http://localhost:8100/v1')
+        self.api_base = os.getenv('GROUNDING_JUDGE_API_BASE', 'http://localhost:12999/v1')
         self.max_tags = int(os.getenv('GROUNDING_JUDGE_MAX_TAGS', str(_MAX_GROUNDINGS_PER_COMPLETION)))
 
         try:
@@ -446,7 +446,7 @@ class GroundingJudgeReward(AsyncORM):
             raise RuntimeError(
                 f'Cannot connect to grounding judge at {self.api_base}. '
                 'Deploy with: CUDA_VISIBLE_DEVICES=0 swift deploy '
-                '--model Qwen2.5-VL-7B-Instruct --port 8100 --infer_backend vllm'
+                '--model Qwen2.5-VL-7B-Instruct --port 12999 --infer_backend vllm'
             ) from e
 
     async def _judge_single(self, session, obj_name: str, b64_crop: str) -> float:

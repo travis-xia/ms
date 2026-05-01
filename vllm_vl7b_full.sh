@@ -6,7 +6,7 @@ MODEL_PATH="/inspire/qb-ilm/project/traffic-congestion-management/xiacheng-24010
 EXP_NAME="grpo_vl7b_full_v0501"
 mkdir -p "output/$EXP_NAME"
 
-GROUNDING_JUDGE_API_BASE=http://localhost:8100/v1 \
+GROUNDING_JUDGE_API_BASE=http://localhost:12999/v1 \
 MAX_PIXELS=401408 \
 VIDEO_MAX_PIXELS=401408 \
 FPS_MAX_FRAMES=16 \
