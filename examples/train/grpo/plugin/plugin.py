@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import io
 import json
 import math
 import os
@@ -325,6 +327,229 @@ class VideoFormatReward(ORM):
 
 
 orms['external_vl_format_reward'] = VideoFormatReward
+
+
+# ---------------------------------------------------------------------------
+# Grounding Judge Reward: uses an external VLM service to verify whether
+# spatiotemporal grounding tags (`<obj>...<box>...<t>...`) actually match
+# the cropped video frame region.
+# ---------------------------------------------------------------------------
+
+_GROUNDING_FULL_PATTERN = re.compile(
+    r'<obj>(.+?)</obj>\s*<box>\[\s*('
+    + _FLOAT_PATTERN + r')\s*,\s*(' + _FLOAT_PATTERN + r')\s*,\s*('
+    + _FLOAT_PATTERN + r')\s*,\s*(' + _FLOAT_PATTERN
+    + r')\s*\]</box>\s*at\s*<t>\s*(' + _FLOAT_PATTERN + r')\s*</t>\s*s'
+)
+
+_JUDGE_SYSTEM_PROMPT = textwrap.dedent("""\
+You are a visual grounding verifier. You will receive:
+1. A cropped image region from a video frame.
+2. An object name that the region is supposed to depict.
+
+Judge whether the cropped region correctly shows the specified object. Choose exactly ONE option:
+
+A. The region accurately and completely shows the object with no significant excess background — the grounding is correct.
+B. The object is present in the region, but the bounding box is slightly too large or too small — minor inaccuracy.
+C. The object may be somewhere in the region, but the bounding box is far too large (e.g. nearly the full frame) — suspected lazy/hack grounding.
+D. The region does not contain the specified object at all — wrong grounding.
+
+Respond with ONLY the single letter (A, B, C, or D), nothing else.""")
+
+_JUDGE_SCORE_MAP = {'A': 1.0, 'B': 0.5, 'C': -0.5, 'D': -1.0}
+
+_MAX_GROUNDINGS_PER_COMPLETION = 4
+
+
+def _extract_groundings(text: str) -> List[Dict]:
+    """Parse all <obj>...<box>...<t>... tags from a completion string."""
+    results = []
+    for m in _GROUNDING_FULL_PATTERN.finditer(text):
+        obj_name = m.group(1).strip()
+        xmin, ymin, xmax, ymax = float(m.group(2)), float(m.group(3)), float(m.group(4)), float(m.group(5))
+        timestamp = float(m.group(6))
+        box_area = (xmax - xmin) * (ymax - ymin) / (1000.0 * 1000.0)
+        results.append({
+            'obj': obj_name,
+            'box': [xmin, ymin, xmax, ymax],
+            'time': timestamp,
+            'box_area_ratio': box_area,
+        })
+    return results
+
+
+def _crop_frame_from_video(video_path: str, timestamp: float,
+                           box: List[float]) -> Optional[str]:
+    """Extract a frame at *timestamp* from *video_path*, crop the box region,
+    and return a base64-encoded JPEG string.  Box coords are 0-1000 normalised."""
+    try:
+        from decord import VideoReader, cpu
+        from PIL import Image
+    except ImportError:
+        logger.warning('decord or Pillow not installed, grounding judge reward disabled')
+        return None
+
+    try:
+        vr = VideoReader(video_path, ctx=cpu(0))
+        fps = vr.get_avg_fps()
+        total_frames = len(vr)
+        frame_idx = min(int(timestamp * fps), total_frames - 1)
+        frame_idx = max(frame_idx, 0)
+        frame = vr[frame_idx].asnumpy()  # H, W, C
+
+        h, w = frame.shape[:2]
+        xmin = int(box[0] / 1000.0 * w)
+        ymin = int(box[1] / 1000.0 * h)
+        xmax = int(box[2] / 1000.0 * w)
+        ymax = int(box[3] / 1000.0 * h)
+        xmin, xmax = max(0, xmin), min(w, xmax)
+        ymin, ymax = max(0, ymin), min(h, ymax)
+        if xmax <= xmin or ymax <= ymin:
+            return None
+
+        crop = frame[ymin:ymax, xmin:xmax]
+        img = Image.fromarray(crop)
+        # Resize long edge to 384 to reduce payload
+        max_side = max(img.size)
+        if max_side > 384:
+            scale = 384 / max_side
+            img = img.resize((int(img.width * scale), int(img.height * scale)), Image.BILINEAR)
+
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=85)
+        return base64.b64encode(buf.getvalue()).decode('utf-8')
+    except Exception as e:
+        logger.warning(f'Failed to crop frame from {video_path} at t={timestamp}: {e}')
+        return None
+
+
+class GroundingJudgeReward(AsyncORM):
+    """Async reward that calls an external VLM judge to verify spatiotemporal
+    grounding tags in MCQ completions.
+
+    Env vars:
+        GROUNDING_JUDGE_API_BASE  – OpenAI-compatible endpoint (default http://localhost:8100/v1)
+        GROUNDING_JUDGE_MAX_TAGS  – max grounding tags to verify per completion (default 3)
+    """
+
+    def __init__(self, args=None, **kwargs):
+        super().__init__(args)
+        from openai import OpenAI
+        self.api_base = os.getenv('GROUNDING_JUDGE_API_BASE', 'http://localhost:8100/v1')
+        self.max_tags = int(os.getenv('GROUNDING_JUDGE_MAX_TAGS', str(_MAX_GROUNDINGS_PER_COMPLETION)))
+
+        try:
+            client = OpenAI(api_key='EMPTY', base_url=self.api_base)
+            self.model_name = client.models.list().data[0].id
+            logger.info(f'GroundingJudgeReward connected to judge model: {self.model_name}')
+        except Exception as e:
+            raise RuntimeError(
+                f'Cannot connect to grounding judge at {self.api_base}. '
+                'Deploy with: CUDA_VISIBLE_DEVICES=0 swift deploy '
+                '--model Qwen2.5-VL-7B-Instruct --port 8100 --infer_backend vllm'
+            ) from e
+
+    async def _judge_single(self, session, obj_name: str, b64_crop: str) -> float:
+        import aiohttp
+        payload = {
+            'model': self.model_name,
+            'messages': [
+                {'role': 'system', 'content': _JUDGE_SYSTEM_PROMPT},
+                {'role': 'user', 'content': [
+                    {'type': 'text', 'text': f'Object name: {obj_name}'},
+                    {'type': 'image_url', 'image_url': {
+                        'url': f'data:image/jpeg;base64,{b64_crop}'}},
+                ]},
+            ],
+            'temperature': 0.0,
+            'max_tokens': 8,
+        }
+        try:
+            async with session.post(
+                    f'{self.api_base}/chat/completions', json=payload,
+                    timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status != 200:
+                    logger.warning(f'Judge API error {resp.status}')
+                    return 0.0
+                result = await resp.json()
+                answer = result['choices'][0]['message']['content'].strip().upper()
+                letter = answer[0] if answer else ''
+                return _JUDGE_SCORE_MAP.get(letter, 0.0)
+        except Exception as e:
+            logger.warning(f'Judge request failed: {e}')
+            return 0.0
+
+    async def __call__(self, completions, solution, **kwargs) -> List[float]:
+        import aiohttp
+
+        videos_list = kwargs.get('videos', [])
+        rewards = []
+        tasks = []     # (completion_idx, grounding_count, task_futures)
+
+        for idx, (completion, sol) in enumerate(zip(completions, solution)):
+            if _is_temporal_answer(sol):
+                rewards.append(0.0)
+                continue
+
+            groundings = _extract_groundings(completion)
+            if not groundings:
+                rewards.append(0.0)
+                continue
+
+            if len(groundings) > self.max_tags:
+                groundings = random.sample(groundings, self.max_tags)
+
+            video_path = ''
+            if idx < len(videos_list):
+                v = videos_list[idx]
+                video_path = v[0] if isinstance(v, list) and v else (v if isinstance(v, str) else '')
+
+            per_completion_tasks = []
+            for g in groundings:
+                b64 = _crop_frame_from_video(video_path, g['time'], g['box'])
+                if b64 is None:
+                    per_completion_tasks.append(None)
+                    continue
+                per_completion_tasks.append((g['obj'], b64, g['box_area_ratio']))
+
+            tasks.append((idx, per_completion_tasks))
+            rewards.append(None)  # placeholder
+
+        if not tasks:
+            return rewards
+
+        async with aiohttp.ClientSession() as session:
+            all_coros = []
+            coro_map = []  # (completion_idx, grounding_idx_in_task, box_area_ratio)
+
+            for comp_idx, per_comp in tasks:
+                for g_idx, item in enumerate(per_comp):
+                    if item is None:
+                        continue
+                    obj_name, b64, area_ratio = item
+                    all_coros.append(self._judge_single(session, obj_name, b64))
+                    coro_map.append((comp_idx, g_idx, area_ratio))
+
+            if all_coros:
+                results = await asyncio.gather(*all_coros)
+            else:
+                results = []
+
+            comp_scores: Dict[int, List[float]] = {}
+            for (comp_idx, _, _), score in zip(coro_map, results):
+                comp_scores.setdefault(comp_idx, []).append(score)
+
+            for comp_idx, scores in comp_scores.items():
+                if scores:
+                    rewards[comp_idx] = sum(scores) / len(scores)
+                else:
+                    rewards[comp_idx] = 0.0
+
+        rewards = [r if r is not None else 0.0 for r in rewards]
+        return rewards
+
+
+orms['external_grounding_judge'] = GroundingJudgeReward
 
 
 class MultiTurnThinkingTips(ORM):

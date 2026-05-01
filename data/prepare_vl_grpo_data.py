@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # Dataset conversion rules for VL GRPO training:
 # 1. Current sampling policy:
-#    - Charades-STA keeps at most the first 2 sentence-span pairs per video.
-#    - ActivityNet randomly keeps half of the videos, then randomly keeps
+#    - Charades-STA keeps at most 1 sentence-span pair per video (the first).
+#    - ActivityNet randomly keeps one quarter of the videos, then randomly keeps
 #      1 sentence-span pair for each selected video.
-#    - TimeLens randomly keeps 1 event per sample.
-#    - Video-R1 keeps only "multiple choice" samples, then randomly keeps half.
+#    - TimeLens randomly keeps half of the samples, then 1 event per kept sample.
+#    - Video-R1 keeps only "multiple choice" samples, then randomly keeps 75%.
 # 2. Charades-STA, ActivityNet, and TimeLens are pure temporal grounding tasks.
 #    They ask the model to locate the start/end timestamps for a description or
 #    query, with one-decimal precision. Solution format:
@@ -40,7 +40,7 @@ SYSTEM_PROMPTS = {
         "<think> </think> and <answer> </answer> tags, respectively. All reasoning must be grounded in visual evidence from the video. "
         "When you mention any related object, person, or specific visual element in the reasoning process, "
         "you must strictly follow the following format: "
-        "`<obj>object_name</obj><box>bounding_box</box>at<t>time_in_seconds</t>s`. "
+        "`<obj>object_name</obj><box>[xmin, ymin, xmax, ymax]</box>at<t>time_in_seconds</t>s`. "
         "Only output the correct option in the <answer> </answer> section."
     ),
 }
@@ -144,7 +144,7 @@ def choose_indices(size, keep, rng):
 def convert_charades(path, video_root, add_token=True):
     data = load_json(path)
     for video_id, ex in data.items():
-        for i, (description, span) in enumerate(zip(ex['sentences'][:2], ex['timestamps'][:2])):
+        for i, (description, span) in enumerate(zip(ex['sentences'][:1], ex['timestamps'][:1])):
             question = (
                 f'The video duration is {float(ex["duration"]):.1f} seconds.\n'
                 f'Locate the start and end timestamps of the video segment corresponding to the description: '
@@ -164,7 +164,7 @@ def convert_charades(path, video_root, add_token=True):
 def convert_activitynet(path, video_root, rng, add_token=True):
     data = load_json(path)
     video_ids = list(data)
-    for video_i in choose_indices(len(video_ids), len(video_ids) // 2, rng):
+    for video_i in choose_indices(len(video_ids), len(video_ids) // 4, rng):
         video_id = video_ids[video_i]
         ex = data[video_id]
         pairs = list(zip(ex['sentences'], ex['timestamps']))
@@ -187,7 +187,10 @@ def convert_activitynet(path, video_root, rng, add_token=True):
 
 
 def convert_timelens(path, video_root, rng, add_token=True):
-    for sample_i, sample in enumerate(iter_jsonl(path)):
+    all_samples = list(iter_jsonl(path))
+    n_keep = len(all_samples) // 2
+    for sample_i in choose_indices(len(all_samples), n_keep, rng):
+        sample = all_samples[sample_i]
         events = sample['events']
         for event_i in choose_indices(len(events), 1, rng):
             event = events[event_i]
@@ -210,7 +213,8 @@ def convert_timelens(path, video_root, rng, add_token=True):
 def convert_video_r1(path, video_root, rng, add_token=True):
     data = load_json(path)
     data = [ex for ex in data if ex.get('problem_type') == 'multiple choice']
-    for i in choose_indices(len(data), len(data) // 2, rng):
+    keep = max(0, (len(data) * 3) // 4)
+    for i in choose_indices(len(data), keep, rng):
         ex = data[i]
         options = '\n'.join(ex['options'])
         question = (
