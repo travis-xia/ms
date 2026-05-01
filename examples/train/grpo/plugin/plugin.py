@@ -141,12 +141,12 @@ orms['external_r1v_acc'] = MultiModalAccuracyORM
 
 
 _FLOAT_PATTERN = r'-?\d+(?:\.\d+)?'
-# Spatiotemporal box: [xmin, ymin, xmax, ymax, timestamp] e.g. [374, 67, 420, 224, 9.2s]
-_BOX_TIME_PATTERN = rf'{_FLOAT_PATTERN}\s*s'
+# Spatiotemporal grounding: <obj>name</obj><box>bounding_box</box>at<t>time_in_seconds</t>s
 _BOX_PATTERN = (
     rf'<box>\[\s*{_FLOAT_PATTERN}\s*,\s*{_FLOAT_PATTERN}\s*,\s*{_FLOAT_PATTERN}\s*,\s*'
-    rf'{_FLOAT_PATTERN}\s*,\s*{_BOX_TIME_PATTERN}\s*\]</box>')
-_GROUNDING_PATTERN = rf'<obj>.+?</obj>\s*{_BOX_PATTERN}'
+    rf'{_FLOAT_PATTERN}\s*\]</box>')
+_TIME_PATTERN = rf'<t>\s*{_FLOAT_PATTERN}\s*</t>\s*s'
+_GROUNDING_PATTERN = rf'<obj>.+?</obj>\s*{_BOX_PATTERN}\s*at\s*{_TIME_PATTERN}'
 
 
 def _extract_last_tag(text: str, tag: str) -> Optional[str]:
@@ -167,6 +167,25 @@ def _parse_spans(text: Optional[str]) -> List[Tuple[float, float]]:
     spans = []
     for start, end in re.findall(rf'\[\s*({_FLOAT_PATTERN})\s*,\s*({_FLOAT_PATTERN})\s*\]', text):
         start, end = float(start), float(end)
+        if end < start:
+            start, end = end, start
+        if end > start:
+            spans.append((start, end))
+    return spans
+
+
+_TEMPORAL_SOLUTION_PATTERN = re.compile(
+    rf'From\s+<t>\s*({_FLOAT_PATTERN})\s*</t>\s*s\s+to\s+<t>\s*({_FLOAT_PATTERN})\s*</t>\s*s'
+)
+
+
+def _parse_temporal_format(text: str) -> List[Tuple[float, float]]:
+    """Parse 'From <t>start</t>s to <t>end</t>s' format."""
+    if not text:
+        return []
+    spans = []
+    for m in _TEMPORAL_SOLUTION_PATTERN.finditer(text):
+        start, end = float(m.group(1)), float(m.group(2))
         if end < start:
             start, end = end, start
         if end > start:
@@ -217,11 +236,7 @@ def _temporal_iou(pred_spans: List[Tuple[float, float]], gt_spans: List[Tuple[fl
 
 
 def _is_temporal_answer(solution: str) -> bool:
-    answer = _extract_last_tag(solution, 'answer')
-    if not answer:
-        return False
-    return len(_parse_spans(answer)) == 1 and re.fullmatch(
-        rf'\s*\[\s*{_FLOAT_PATTERN}\s*,\s*{_FLOAT_PATTERN}\s*\]\s*', answer) is not None
+    return _TEMPORAL_SOLUTION_PATTERN.search(solution) is not None
 
 
 def _normalize_choice(answer: Optional[str]) -> str:
@@ -242,8 +257,8 @@ class VideoTaskReward(ORM):
         rewards = []
         for completion, sol in zip(completions, solution):
             if _is_temporal_answer(sol):
-                pred_spans = _parse_spans(_extract_last_tag(completion, 'answer'))
-                gt_spans = _parse_spans(_extract_last_tag(sol, 'answer'))
+                pred_spans = _parse_temporal_format(_extract_last_tag(completion, 'answer') or '')
+                gt_spans = _parse_temporal_format(sol)
                 rewards.append(_temporal_iou(pred_spans, gt_spans))
                 continue
 
@@ -279,22 +294,31 @@ class VideoFormatReward(ORM):
         rewards = []
         for completion, sol in zip(completions, solution):
             reward = 0.0
-            has_redacted_thinking = _has_single_nonempty_tag(completion, 'redacted_thinking')
+            has_think = _has_single_nonempty_tag(completion, 'think')
             has_answer = _has_single_nonempty_tag(completion, 'answer')
 
-            if has_redacted_thinking and has_answer:
+            if has_think and has_answer:
                 reward += 1.0
             elif has_answer:
                 reward += 0.5
 
-            # Step-by-step reward shaping for grounding (obj + spatiotemporal box)
-            if '<obj>' in completion and '</obj>' in completion:
-                reward += 0.2
-            if re.search(_BOX_PATTERN, completion, re.DOTALL) is not None:
-                reward += 0.3
-
-            if re.search(_GROUNDING_PATTERN, completion, re.DOTALL) is not None:
-                reward += 0.5
+            if _is_temporal_answer(sol):
+                # Temporal tasks: reward <t> usage and correct answer format
+                answer_text = _extract_last_tag(completion, 'answer') or ''
+                if re.search(_TIME_PATTERN, completion, re.DOTALL) is not None:
+                    reward += 0.1
+                if _TEMPORAL_SOLUTION_PATTERN.search(answer_text) is not None:
+                    reward += 0.9
+            else:
+                # Non-temporal tasks: reward spatiotemporal grounding tags
+                if '<obj>' in completion and '</obj>' in completion:
+                    reward += 0.1
+                if re.search(_BOX_PATTERN, completion, re.DOTALL) is not None:
+                    reward += 0.1
+                if re.search(_TIME_PATTERN, completion, re.DOTALL) is not None:
+                    reward += 0.1
+                if re.search(_GROUNDING_PATTERN, completion, re.DOTALL) is not None:
+                    reward += 0.7
 
             rewards.append(reward * scale)
         return rewards

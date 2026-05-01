@@ -1,7 +1,7 @@
 # 8*H200 GPU
 set -o pipefail
 
-EXP_NAME="grpo_vl7b_full_v1"
+EXP_NAME="grpo_vl7b_full_v0501"
 mkdir -p "output/$EXP_NAME"
 
 MAX_PIXELS=401408 \

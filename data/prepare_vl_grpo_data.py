@@ -8,18 +8,49 @@
 #    - Video-R1 keeps only "multiple choice" samples, then randomly keeps half.
 # 2. Charades-STA, ActivityNet, and TimeLens are pure temporal grounding tasks.
 #    They ask the model to locate the start/end timestamps for a description or
-#    query, with one-decimal precision. Final answer format:
-#    <answer>[start, end]</answer>
+#    query, with one-decimal precision. Solution format:
+#    From <t>start</t>s to <t>end</t>s
 # 3. Video-R1 is kept here as answer-only QA. We only convert
 #    "multiple choice" samples and filter out all "numerical" samples.
-#    Final answer format:
-#    <answer>B</answer>
+#    Solution format: <answer>B</answer>
 # 4. Therefore the merged dataset contains two output patterns:
-#    timestamp-only and answer-only.
+#    temporal and answer-only.
+# 5. Each record includes a per-dataset system prompt (role=system) that
+#    aligns with Stage-2 system prompts.
 import argparse
 import json
 import random
 from pathlib import Path
+
+SYSTEM_PROMPTS = {
+    "temporal": (
+        "A conversation between user and assistant. The user provides a video and asks a question, "
+        "and the Assistant determines the precise time period that answers the question. "
+        "The assistant MUST first think about the reasoning process in the mind and then provide the user with the answer. "
+        "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively. "
+        "When mentioning time during the reasoning process, the assistant must use the format: "
+        "`<t>time_in_seconds</t>s'. "
+        "The answer must strictly follow the following format: "
+        "`From <t>start_time</t>s to <t>end_time</t>s'."
+    ),
+    "mcq": (
+        "A conversation between user and assistant. The user provides a video and asks a multiple-choice question, "
+        "and the Assistant solves it. The assistant MUST first think about the reasoning process in the mind "
+        "and then provide the user with the answer. The reasoning process and answer are enclosed within "
+        "<think> </think> and <answer> </answer> tags, respectively. All reasoning must be grounded in visual evidence from the video. "
+        "When you mention any related object, person, or specific visual element in the reasoning process, "
+        "you must strictly follow the following format: "
+        "`<obj>object_name</obj><box>bounding_box</box>at<t>time_in_seconds</t>s`. "
+        "Only output the correct option in the <answer> </answer> section."
+    ),
+}
+
+DATASET_TO_PROMPT_TYPE = {
+    "charades_sta": "temporal",
+    "activitynet": "temporal",
+    "timelens": "temporal",
+    "video_r1": "mcq",
+}
 
 
 def fmt_time(value):
@@ -32,7 +63,8 @@ def fmt_span(span):
 
 
 def timestamp_answer(span):
-    return f'<answer>{fmt_span(span)}</answer>'
+    start, end = span
+    return f'From <t>{fmt_time(start)}</t>s to <t>{fmt_time(end)}</t>s'
 
 
 def add_video_token(question, enabled=True):
@@ -47,13 +79,15 @@ def resolve_video_path(video_root, relative_path):
 
 
 def make_record(sample_id, dataset, question, video, solution, add_token=True):
+    prompt_type = DATASET_TO_PROMPT_TYPE[dataset]
+    system_prompt = SYSTEM_PROMPTS[prompt_type]
     return {
         'id': sample_id,
         'dataset': dataset,
-        'messages': [{
-            'role': 'user',
-            'content': add_video_token(question, add_token),
-        }],
+        'messages': [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': add_video_token(question, add_token)},
+        ],
         'videos': [video],
         'solution': solution,
     }
@@ -112,13 +146,9 @@ def convert_charades(path, video_root, add_token=True):
     for video_id, ex in data.items():
         for i, (description, span) in enumerate(zip(ex['sentences'][:2], ex['timestamps'][:2])):
             question = (
-                f'You are a helpful assistant.\n'
                 f'The video duration is {float(ex["duration"]):.1f} seconds.\n'
                 f'Locate the start and end timestamps of the video segment corresponding to the description: '
-                f'{description}\n'
-                f'Please provide the start and end timestamps in seconds, precise to one decimal place.\n'
-                f'Your final answer must be in the format: '
-                f'<answer>[start, end]</answer>.'
+                f'{description}'
             )
             video = resolve_video_path(video_root, f'{video_id}.mp4')
             yield make_record(
@@ -141,13 +171,9 @@ def convert_activitynet(path, video_root, rng, add_token=True):
         for i in choose_indices(len(pairs), 1, rng):
             description, span = pairs[i]
             question = (
-                f'You are a helpful assistant.\n'
                 f'The video duration is {float(ex["duration"]):.1f} seconds.\n'
                 f'Locate the start and end timestamps of the video segment corresponding to the description: '
-                f'{description}\n'
-                f'Please provide the start and end timestamps in seconds, precise to one decimal place.\n'
-                f'Your final answer must be in the format: '
-                f'<answer>[start, end]</answer>.'
+                f'{description}'
             )
             video = resolve_video_path(video_root, f'{video_id}.mp4')
             yield make_record(
@@ -167,13 +193,9 @@ def convert_timelens(path, video_root, rng, add_token=True):
             event = events[event_i]
             span = event['span'][0]
             question = (
-                f'You are a helpful assistant.\n'
                 f'The video duration is {float(sample["duration"]):.1f} seconds.\n'
                 f'Locate the start and end timestamps of the video segment corresponding to the query: '
-                f'{event["query"]}\n'
-                f'Please provide the start and end timestamps in seconds, precise to one decimal place.\n'
-                f'Your final answer must be in the format: '
-                f'<answer>[start, end]</answer>.'
+                f'{event["query"]}'
             )
             yield make_record(
                 f'timelens-{sample_i}-{event_i}',
@@ -192,12 +214,8 @@ def convert_video_r1(path, video_root, rng, add_token=True):
         ex = data[i]
         options = '\n'.join(ex['options'])
         question = (
-            f'You are a helpful assistant.\n'
             f'Question: {ex["problem"]}\n'
-            f'Options:\n{options}\n'
-            f'Please answer the question.\n'
-            f'Your final answer must be in the format: '
-            f'<answer>B</answer>.'
+            f'Options:\n{options}'
         )
         yield make_record(
             f'video-r1-{ex["problem_id"]}',
