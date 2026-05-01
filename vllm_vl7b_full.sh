@@ -12,8 +12,8 @@ CUDA_VISIBLE_DEVICES=0 swift deploy \
     --model "$MODEL_PATH" \
     --port "$JUDGE_PORT" \
     --infer_backend vllm \
-    --gpu_memory_utilization 0.85 \
-    --max_model_len 4096 \
+    --vllm_gpu_memory_utilization 0.85 \
+    --vllm_max_model_len 4096 \
     > "output/$EXP_NAME/judge.log" 2>&1 &
 JUDGE_PID=$!
 
